@@ -5,16 +5,32 @@ import quaternionic
 import rospy
 from std_msgs.msg import String, Bool
 
+
+
 class ArucoDetection():
     def __init__(self):
         rospy.init_node('camera_listener', anonymous=True)
         self.image_sub = rospy.Subscriber("/aruco_detection_activation", Bool, self.loop)
         self.obj_pub = rospy.Publisher("/aruco_detection", String, queue_size=10)
+        self.trasl_list = []
+
+
+    def tf2quat_tr(self, tf):
+        quat = quaternionic.array.from_rotation_matrix(tf[:3, :3])
+        trasl = tf[:3, 3]
+        return trasl, quat
 
     def get_transform_matrix(self, r_mat, t_vec):
         tf_mat = np.concatenate((r_mat, t_vec.reshape(3,1)), axis=1)
         tf_mat = np.concatenate((tf_mat, np.array([[0, 0, 0, 1]])), axis=0)
         return tf_mat
+    
+    def moving_average_filter(self, sample, sequence, window_size):
+            if len(sequence) > window_size:
+                sequence.append(sample)
+                sequence=sequence[1:]
+            if len(sequence) == window_size:
+                yield sum(sequence) / len(sequence)
 
     def estimatePoseSingleMarkers(self, corners, marker_size, mtx, distortion):
         '''
@@ -76,40 +92,7 @@ class ArucoDetection():
                 # show the output image
         return image
 
-    def init_zed(self, resolution):
-        # Create a ZED camera object
-        zed = sl.Camera()
 
-        # Set configuration parameters
-        input_type = sl.InputType()
-
-        init = sl.InitParameters(input_t=input_type)
-        init.camera_resolution = resolution
-        init.depth_mode = sl.DEPTH_MODE.PERFORMANCE
-        init.coordinate_units = sl.UNIT.MILLIMETER
-
-        # Open the camera
-        err = zed.open(init)
-        if err != sl.ERROR_CODE.SUCCESS :
-            print(repr(err))
-            zed.close()
-            exit(1)
-
-        # Set runtime parameters after opening the camera
-        runtime = sl.RuntimeParameters()
-        runtime.sensing_mode = sl.SENSING_MODE.STANDARD
-        image_size = zed.get_camera_information().camera_resolution
-        print(image_size.width, image_size.height)
-        image_zed = sl.Mat(image_size.width, image_size.height, sl.MAT_TYPE.U8_C4)
-        return zed, image_size, image_zed
-
-    def grab_zed_frame(self, zed, image_size, image_zed):
-        if zed.grab() == sl.ERROR_CODE.SUCCESS :
-            # Retrieve the left image in sl.Mat
-            zed.retrieve_image(image_zed, sl.VIEW.LEFT, sl.MEM.CPU, image_size)
-            # Use get_data() to get the numpy array
-            image_ocv = image_zed.get_data()
-            return image_ocv
 
     def loop(self):
 
@@ -119,42 +102,63 @@ class ArucoDetection():
             [0.0, 0.0, -1.0]
         ])
 
-        baxter2ref = np.asarray([   [ 1.0,  0.0,  0.0,  0.57760038],
-                                    [ 0.0, -1.0, -0.0, -0.21290103],
-                                    [-0.0,  0.11744118, -1.0, -0.30567865],
+        baxter2ref = np.asarray([   [ 1.0,  0.0,  0.0,  0.668],
+                                    [ 0.0, -1.0, -0.0, -0.245],
+                                    [-0.0,  0.0, -1.0, -0.324],
                                     [ 0.0,          0.0,          0.0,          1.0        ]])
-        
-        camera2ref = np.load('/home/index1/index_ws/src/zed_cv2/cam2ref.npy')
+        baxter2ref[2,3] += 0.04
 
-        calibration_matrix_path = "/home/index1/index_ws/src/zed_cv2/zed2_calibration_matrix.npy"
+
+
+        logi2ref = np.load("/home/index1/index_ws/src/zed_cv2/logi2ref.npy")
+        np.set_printoptions(formatter={'float': lambda x: "{0:0.3f}".format(x)})
+        calibration_matrix_path = "/home/index1/index_ws/src/zed_cv2/logitech_calibration_matrix.npy"
         calibration_matrix = np.load(calibration_matrix_path)   
-
-        distortion_path = "/home/index1/index_ws/src/zed_cv2/zed2_distortion.npy"
+        # calibration_matrix = np.asarray([   [ 1463.4,  0.0,  964.2],
+        #                                     [ 0.0, 1464.9, 572.5],
+        #                                     [0.0,  0.0, 1.0]])
+        print(calibration_matrix)
+        distortion_path = "/home/index1/index_ws/src/zed_cv2/logitech_distortion.npy"
         distortion = np.load(distortion_path)
-        print(distortion)
+        # distortion = np.asarray([[0.0522,  -0.1169,  -0.003,  0.005, -0.01]])
+        print('\n',distortion)
         arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_250) #cv2.aruco.DICT_ARUCO_ORIGINAL
         arucoParams = cv2.aruco.DetectorParameters()
         arucoDetector = cv2.aruco.ArucoDetector(arucoDict, arucoParams)
 
-        zed, image_size, image_zed = self.init_zed(sl.RESOLUTION.HD2K)
+        cap = cv2.VideoCapture(0)
+
+        #resolution stuff
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        print(width, height)
+
         # print(zed.get_camera_information())
         real_ids = []
         iterations = 0
 
         while iterations<20:
-            image_ocv = self.grab_zed_frame(zed, image_size, image_zed)
-            # print(image_ocv.dtype)
+            ret, image_ocv = cap.read()
+
             # Display the left image from the numpy array
             image_ocv_grey = cv2.cvtColor(image_ocv, cv2.COLOR_BGR2GRAY)
             corners, ids, rejected = arucoDetector.detectMarkers(image_ocv_grey)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.0005)
+
 
             if ids is not None:
+                corners = cv2.cornerSubPix(image_ocv_grey, corners[0], (3, 3), (-1, -1), criteria)
                 for id in ids:
                     if id not in real_ids:
                         real_ids.append(id)
 
             # rvec, tvec, _ = self.estimatePoseSingleMarkers(corners, 0.251, calibration_matrix, distortion)
-            rvec, tvec, _ = self.estimatePoseSingleMarkers(corners, 0.0375, calibration_matrix, distortion)
+            rvec, tvec, _ = self.estimatePoseSingleMarkers(corners, 0.037, calibration_matrix, distortion)
+
+            # self.trasl_list.append(tvec)
+            # tvec = self.moving_average_filter(tvec, self.trasl_list, 10)
 
             rod = [cv2.Rodrigues(r)[0] for r in rvec]
             # # print(np.where(ids == 100))
@@ -163,34 +167,27 @@ class ArucoDetection():
 
 
             if len(ref_row[0]) != 0:
-            # if len(ref_row[0]) != 0 and len(pos_row[0]) != 0:
                 ref_row = ref_row[0][0]
-                # pos_row = pos_row[0][0]
-                # ref_col = np.where(ids == 100)[1][0]
-                # print(ref_row)
+
 
                 ref_rot = rod[ref_row]
                 ref_rot = np.dot(ref_rot, static_rot)
                 rvec[ref_row] = cv2.Rodrigues(ref_rot)[0]
                 ref_trasl = tvec[ref_row]
 
-                # print(ref_rot)
-                # print(ref_trasl)
-
-                # pos_rot = rod[pos_row]
-                # pos_trasl = tvec[pos_row]
-
-                # print(pos_rot)
-                # print(pos_trasl)
 
                 ref_tf = self.get_transform_matrix(ref_rot, ref_trasl)
+                # print(ref_tf)
                 # bax2obj = np.dot(baxter2camera, ref_tf)
                 # print(bax2obj)
-                print(np.dot(baxter2ref, np.dot(np.linalg.inv(camera2ref), ref_tf)))
-                # print(np.dot(np.linalg.inv(camera2ref), ref_tf))
-                # np.save('/home/index1/index_ws/src/zed_cv2/cam2ref.npy', ref_tf)
+                trasl, r = self.tf2quat_tr(np.dot(baxter2ref, np.dot(np.linalg.inv(logi2ref), ref_tf)))
+                print(trasl)
+                print(r)
+                return trasl, r
+                # print(np.dot(baxter2ref, np.linalg.inv(logi2ref)))
+                # print(np.dot(np.linalg.inv(logi2ref), ref_tf))
+                # np.save('/home/index1/index_ws/src/zed_cv2/logi2ref.npy', ref_tf)
                 # pos_tf = get_transform_matrix(pos_rot, pos_trasl)
-                # print(ref_tf)
                 # np.set_printoptions(formatter={'float': lambda x: "{0:0.2f}".format(x)})
                 # ref_to_pos_tf = np.dot(np.linalg.inv(ref_tf), pos_tf)
 
@@ -215,7 +212,7 @@ class ArucoDetection():
 
             if tvec.shape[0] > 0 and rvec.shape[0] > 0:
                 for j in range(tvec.shape[0]):
-                    cv2.drawFrameAxes(image_ocv, calibration_matrix, distortion, rvec[j], tvec[j], 0.05) 
+                    cv2.drawFrameAxes(image_ocv, calibration_matrix, distortion, rvec[j], tvec[j], 0.1) 
                     
             image_resize = cv2.resize(image_ocv, (1280, 720))
             cv2.imshow("Image", image_resize)
@@ -223,7 +220,6 @@ class ArucoDetection():
                 break
         self.obj_pub.publish('_'.join([str(id) for id in real_ids]))
         cv2.destroyAllWindows()
-        zed.close()
 
     def listener(self):
         rospy.loginfo("I am listening to the camera")
